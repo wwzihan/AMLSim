@@ -519,6 +519,9 @@ class LogConverter:
         self.org_types = dict()  # ID, organization type
 
         self.fake = fake
+        converter_conf = conf.get("converter", {})
+        self.disable_dedup = converter_conf.get("disable_dedup", False) or \
+            os.getenv("AMLSIM_DISABLE_DEDUP", "").lower() in {"1", "true", "yes"}
 
         general_conf = conf.get('general', {})
         input_conf = conf.get('temporal', {})  # Input directory of this converter is temporal directory
@@ -573,6 +576,8 @@ class LogConverter:
     def convert_acct_tx(self):
         print("Convert transaction list from %s to %s, %s and %s" % (
             self.log_file, self.tx_file, self.cash_tx_file, self.alert_tx_file))
+        if self.disable_dedup:
+            print("Deduplication disabled for transaction conversion.")
 
         in_acct_f = open(os.path.join(self.input_dir, self.in_acct_file), "r")  # Input account file
         in_tx_f = open(self.log_file, "r")  # Transaction log file from the Java simulator
@@ -737,8 +742,8 @@ class LogConverter:
         out_ent_f.close()
 
         # Avoid duplicated transaction CSV rows in the log file
-        tx_set = set()
-        cash_tx_set = set()
+        tx_set = set() if not self.disable_dedup else None
+        cash_tx_set = set() if not self.disable_dedup else None
 
         # Load transaction log from the Java simulator
         reader = csv.reader(in_tx_f)
@@ -786,18 +791,20 @@ class LogConverter:
             attr = {name: row[index] for name, index in indices.items()}
             if ttype in CASH_TYPES:  # Cash transactions
                 cash_tx = (orig_id, dest_id, ttype, amount, date_str)
-                if cash_tx not in cash_tx_set:
-                    cash_tx_set.add(cash_tx)
+                if self.disable_dedup or cash_tx not in cash_tx_set:
+                    if not self.disable_dedup:
+                        cash_tx_set.add(cash_tx)
                     output_row = self.schema.get_tx_row(tx_id, date_str, amount, ttype, orig_id, dest_id,
                                                         is_sar, alert_id, **attr)
                     cash_tx_writer.writerow(output_row)
             else:  # Account-to-account transactions including alert transactions
                 tx = (orig_id, dest_id, ttype, amount, date_str)
-                if tx not in tx_set:
+                if self.disable_dedup or tx not in tx_set:
                     output_row = self.schema.get_tx_row(tx_id, date_str, amount, ttype, orig_id, dest_id,
                                                         is_sar, alert_id, **attr)
                     tx_writer.writerow(output_row)
-                    tx_set.add(tx)
+                    if not self.disable_dedup:
+                        tx_set.add(tx)
             if is_alert:  # Alert transactions
                 alert_type = self.reports.get(alert_id).get_reason()
                 alert_row = self.schema.get_alert_tx_row(alert_id, alert_type, is_sar, tx_id, orig_id, dest_id,
@@ -864,6 +871,43 @@ class LogConverter:
                                                         model_id, schedule_id, bank_id, **attr)
             writer.writerow(output_row)
 
+    def load_reports_from_alert_members(self):
+        input_file = os.path.join(self.input_dir, self.group_file)
+        print("Reload alert groups into memory from %s" % input_file)
+        with open(input_file, "r") as rf:
+            reader = csv.reader(rf)
+            header = next(reader)
+            indices = {name: index for index, name in enumerate(header)}
+
+            for row in reader:
+                reason = row[indices["reason"]]
+                alert_id = int(row[indices["alertID"]])
+                account_id = int(row[indices["accountID"]])
+                is_sar = row[indices["isSAR"]].lower() == "true"
+
+                if alert_id not in self.reports:
+                    self.reports[alert_id] = AMLTypology(reason)
+                self.reports[alert_id].add_member(account_id, is_sar)
+
+    def load_org_types_from_input_accounts(self):
+        input_file = os.path.join(self.input_dir, self.in_acct_file)
+        print("Reload account types into memory from %s" % input_file)
+        with open(input_file, "r") as rf:
+            reader = csv.reader(rf)
+            header = next(reader)
+            indices = {name: index for index, name in enumerate(header)}
+            acct_id_idx = indices["ACCOUNT_ID"]
+            acct_type_idx = indices["ACCOUNT_TYPE"]
+
+            for idx, row in enumerate(reader, 1):
+                self.org_types[int(row[acct_id_idx])] = row[acct_type_idx]
+                if idx % 1000000 == 0:
+                    print("Reloaded %d account types." % idx)
+
+    def resume_sar_cases(self):
+        self.load_reports_from_alert_members()
+        self.load_org_types_from_input_accounts()
+        self.output_sar_cases()
 
     def output_sar_cases(self):
         """Extract SAR account list involved in alert transactions from transaction log file
@@ -959,11 +1003,13 @@ if __name__ == "__main__":
     argv = sys.argv
 
     if len(argv) < 2:
-        print("Usage: python3 %s [ConfJSON]" % argv[0])
+        print("Usage: python3 %s [ConfJSON] [SimulationName] [--sar-only]" % argv[0])
         exit(1)
 
     _conf_json = argv[1]
-    _sim_name = argv[2] if len(argv) >= 3 else None
+    extra_args = argv[2:]
+    _sar_only = "--sar-only" in extra_args
+    _sim_name = next((arg for arg in extra_args if not arg.startswith("--")), None)
 
     with open(_conf_json, "r") as rf:
         conf = json.load(rf)
@@ -971,6 +1017,9 @@ if __name__ == "__main__":
     fake = Faker(['en_US'])
     Faker.seed(0)
     converter = LogConverter(conf, _sim_name, fake)
-    converter.convert_alert_members()
-    converter.convert_acct_tx()
-    converter.output_sar_cases()
+    if _sar_only:
+        converter.resume_sar_cases()
+    else:
+        converter.convert_alert_members()
+        converter.convert_acct_tx()
+        converter.output_sar_cases()

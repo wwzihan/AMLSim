@@ -6,6 +6,7 @@ class Nominator:
         self.degree_threshold = degree_threshold
         self.remaining_count_dict = dict()
         self.used_count_dict = dict()
+        self.used_main_ids = set()
         self.fan_in_candidates = self.get_fan_in_candidates()
         self.fan_out_candidates = self.get_fan_out_candidates()
         self.alt_fan_in_candidates = []
@@ -39,14 +40,16 @@ class Nominator:
     def get_fan_in_candidates(self):
         return sorted(
             (n for n in self.g.nodes() if self.is_fan_in_candidate(n)),
-            key=lambda n: self.g.out_degree(n)
+            key=lambda n: (self.g.out_degree(n), self.g.in_degree(n)),
+            reverse=True
         )
 
     
     def get_fan_out_candidates(self):
         return sorted(
             (n for n in self.g.nodes() if self.is_fan_out_candidate(n)),
-            key=lambda n: self.g.in_degree(n)
+            key=lambda n: (self.g.out_degree(n), self.g.in_degree(n)),
+            reverse=True
         )
 
 
@@ -87,6 +90,7 @@ class Nominator:
         if node_id is None:
             self.conclude(type)
         else:
+            self.used_main_ids.add(node_id)
             self.decrement(type)
             self.increment_used(type)
         return node_id
@@ -272,26 +276,44 @@ class Nominator:
     def get_forward_candidates(self):
         return sorted(
             (n for n in self.g.nodes() if self.g.in_degree(n) >= 1 and self.g.out_degree(n) >= 1),
-            key=lambda n: max(self.g.in_degree(n), self.g.out_degree(n))
+            key=lambda n: max(self.g.in_degree(n), self.g.out_degree(n)),
+            reverse=True
         )
 
 
     def get_single_candidates(self):
         return sorted(
             (n for n in self.g.nodes() if self.g.out_degree(n) >= 1),
-            key=lambda n: self.g.out_degree(n)
+            key=lambda n: self.g.out_degree(n),
+            reverse=True
         )
 
 
     def next_node_id(self, index, list):
-        try:
-            node_id = list[index]
-        except IndexError:
+        index, node_id = self._next_node_id(index, list, skip_used=True)
+        if node_id is not None:
+            return index, node_id
+        return self._next_node_id(index, list, skip_used=False)
+
+
+    def _next_node_id(self, index, candidates, skip_used):
+        if len(candidates) == 0:
+            return 0, None
+
+        if index >= len(candidates):
             index = 0
-            if len(list) == 0:
-                return index, None
-            node_id = list[index]
-        return index, node_id
+
+        start_index = index
+        while True:
+            node_id = candidates[index]
+            if not skip_used or node_id not in self.used_main_ids:
+                return index, node_id
+
+            index += 1
+            if index >= len(candidates):
+                index = 0
+            if index == start_index:
+                return start_index, None
 
     
     def is_done(self, node_id, type):
@@ -417,4 +439,3 @@ class Nominator:
                     raise ValueError('something broke in breakdown')
             return candidates
         
-
